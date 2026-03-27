@@ -389,9 +389,12 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `GOOGLE_WORKSPACE_CLI_SANITIZE_MODE` | `warn` (default) or `block` |
 | `GOOGLE_WORKSPACE_CLI_LOG` | Log level for stderr (e.g., `gws=debug`). Off by default. |
 | `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON log files with daily rotation. Off by default. |
+| `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE` | File path for file operation audit logs (Drive/Docs/Sheets, JSONL). Default: `~/.config/gws/file-ops-audit.jsonl` |
 | `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands |
 
 Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy)).
+
+For file-audit behavior and label examples, see [docs/file-audit-labels.md](docs/file-audit-labels.md).
 
 ## Exit Codes
 

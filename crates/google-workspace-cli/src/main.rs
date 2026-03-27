@@ -498,6 +498,9 @@ fn print_usage() {
     println!(
         "    GOOGLE_WORKSPACE_CLI_LOG_FILE            Directory for JSON log files (daily rotation)"
     );
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE   File path for file-op audit logs (Drive/Docs/Sheets, JSONL)"
+    );
     println!();
     println!("EXIT CODES:");
     for (code, description) in crate::error::EXIT_CODE_DOCUMENTATION {

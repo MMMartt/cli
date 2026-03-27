@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Context;
+use chrono::{SecondsFormat, Utc};
 use futures_util::stream::TryStreamExt;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
@@ -89,6 +90,624 @@ struct ExecutionInput {
     full_url: String,
     query_params: Vec<(String, String)>,
     is_upload: bool,
+}
+
+const FILE_AUDIT_LOG_ENV: &str = "GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE";
+const FILE_AUDIT_LOG_DEFAULT_FILE: &str = "file-ops-audit.jsonl";
+
+#[derive(Debug, Clone)]
+struct FileAuditContext {
+    service: String,
+    resource: String,
+    operation: String,
+    method_id: String,
+    http_method: String,
+    request_ids: Vec<String>,
+    request_metadata: Option<Value>,
+    upload_source: Option<String>,
+}
+
+fn is_drive_files_method(doc: &RestDescription, method: &RestMethod) -> bool {
+    doc.name == "drive"
+        && method
+            .id
+            .as_deref()
+            .map(|id| id.starts_with("drive.files."))
+            .unwrap_or_else(|| method.path.contains("files"))
+}
+
+fn is_docs_documents_method(doc: &RestDescription, method: &RestMethod) -> bool {
+    doc.name == "docs"
+        && method
+            .id
+            .as_deref()
+            .map(|id| id.starts_with("docs.documents."))
+            .unwrap_or_else(|| method.path.contains("documents"))
+}
+
+fn is_sheets_spreadsheets_method(doc: &RestDescription, method: &RestMethod) -> bool {
+    doc.name == "sheets"
+        && method
+            .id
+            .as_deref()
+            .map(|id| id.starts_with("sheets.spreadsheets."))
+            .unwrap_or_else(|| method.path.contains("spreadsheets"))
+}
+
+fn classify_file_operation(
+    service: &str,
+    method_id: &str,
+    http_method: &str,
+    query_params: &[(String, String)],
+) -> String {
+    let method_name = method_id
+        .split('.')
+        .next_back()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match method_name.as_str() {
+        "create" => "create".to_string(),
+        "update" => "update".to_string(),
+        "delete" => "delete".to_string(),
+        "copy" => "copy".to_string(),
+        "list" => "list".to_string(),
+        "export" => "export".to_string(),
+        "watch" => "watch".to_string(),
+        "append" => "append".to_string(),
+        "batchupdate" => "update".to_string(),
+        "clear" => "clear".to_string(),
+        "generateids" => "generate_ids".to_string(),
+        "emptytrash" => "empty_trash".to_string(),
+        "modifylabels" => "modify_labels".to_string(),
+        "get" => {
+            let is_media_download = service == "drive"
+                && query_params
+                    .iter()
+                    .any(|(k, v)| k == "alt" && v.eq_ignore_ascii_case("media"));
+            if is_media_download {
+                "download".to_string()
+            } else {
+                "get".to_string()
+            }
+        }
+        _ => match http_method {
+            "GET" => "read",
+            "POST" => "create_or_action",
+            "PUT" => "replace",
+            "PATCH" => "patch",
+            "DELETE" => "delete",
+            _ => "unknown",
+        }
+        .to_string(),
+    }
+}
+
+fn collect_request_id_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(arr) => {
+            for item in arr {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    other => out.push(other.to_string()),
+                }
+            }
+        }
+        other => out.push(other.to_string()),
+    }
+}
+
+fn is_matching_id_key(name: &str, id_keys: &[String]) -> bool {
+    let name_lower = name.to_ascii_lowercase();
+    id_keys
+        .iter()
+        .any(|k| name_lower == *k || name_lower.ends_with(k))
+}
+
+fn extract_request_ids(
+    method: &RestMethod,
+    params: &Map<String, Value>,
+    id_keys: &[&str],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    let id_keys_lower: Vec<String> = id_keys.iter().map(|k| k.to_ascii_lowercase()).collect();
+
+    for (name, param_def) in &method.parameters {
+        if param_def.location.as_deref() != Some("path") {
+            continue;
+        }
+        if is_matching_id_key(name, &id_keys_lower) {
+            if let Some(value) = params.get(name) {
+                collect_request_id_values(value, &mut ids);
+            }
+        }
+    }
+
+    if ids.is_empty() {
+        for (name, value) in params {
+            if is_matching_id_key(name, &id_keys_lower) {
+                collect_request_id_values(value, &mut ids);
+            }
+        }
+    }
+
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn extract_request_metadata(body: Option<&Value>) -> Option<Value> {
+    let Some(Value::Object(obj)) = body else {
+        return None;
+    };
+
+    let mut metadata = Map::new();
+    for key in [
+        "id",
+        "fileId",
+        "documentId",
+        "spreadsheetId",
+        "name",
+        "title",
+        "range",
+        "mimeType",
+        "parents",
+        "trashed",
+        "labelInfo",
+        "labels",
+    ] {
+        if let Some(value) = obj.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn extract_drive_file_metadata(file_value: &Value) -> Option<Value> {
+    let Value::Object(obj) = file_value else {
+        return None;
+    };
+
+    let mut metadata = Map::new();
+    for key in [
+        "id",
+        "name",
+        "mimeType",
+        "parents",
+        "trashed",
+        "createdTime",
+        "modifiedTime",
+        "driveId",
+        "labelInfo",
+        "labels",
+    ] {
+        if let Some(value) = obj.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if !metadata.is_empty() {
+        return Some(Value::Object(metadata));
+    }
+
+    if obj.get("id").is_some() || obj.get("name").is_some() {
+        return Some(file_value.clone());
+    }
+
+    None
+}
+
+fn extract_drive_touched_files(response_json: &Value) -> Vec<Value> {
+    let mut touched = Vec::new();
+
+    if let Some(files) = response_json.get("files").and_then(|v| v.as_array()) {
+        for file in files {
+            if let Some(meta) = extract_drive_file_metadata(file) {
+                touched.push(meta);
+            }
+        }
+        return touched;
+    }
+
+    if let Some(meta) = extract_drive_file_metadata(response_json) {
+        touched.push(meta);
+    }
+
+    touched
+}
+
+fn collect_classification_label_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(arr) => {
+            for item in arr {
+                collect_classification_label_values(item, out);
+            }
+        }
+        Value::Number(n) => out.push(n.to_string()),
+        Value::Bool(b) => out.push(b.to_string()),
+        _ => {}
+    }
+}
+
+fn derive_classification_label_values_from_label_list(label_list: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+
+    if let Some(labels) = label_list.get("labels").and_then(|v| v.as_array()) {
+        for label in labels {
+            if let Some(fields) = label.get("fields").and_then(|v| v.as_object()) {
+                for field in fields.values() {
+                    for key in [
+                        "selection",
+                        "text",
+                        "integer",
+                        "dateString",
+                        "classificationLabelValue",
+                        "calssificationLabelValue",
+                    ] {
+                        if let Some(v) = field.get(key) {
+                            collect_classification_label_values(v, &mut values);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for key in ["classificationLabelValue", "calssificationLabelValue"] {
+        if let Some(v) = label_list.get(key) {
+            collect_classification_label_values(v, &mut values);
+        }
+    }
+
+    values.retain(|v| !v.is_empty());
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn should_fetch_drive_label_enrichment(ctx: &FileAuditContext) -> bool {
+    (ctx.service == "docs" && ctx.resource == "documents")
+        || (ctx.service == "sheets" && ctx.resource == "spreadsheets")
+        || (ctx.service == "drive" && ctx.resource == "files" && ctx.operation == "modify_labels")
+}
+
+fn build_drive_label_enrichment_entity(
+    ctx: &FileAuditContext,
+    file_id: &str,
+    label_list: Value,
+) -> Value {
+    let mut entity = Map::new();
+    match (ctx.service.as_str(), ctx.resource.as_str()) {
+        ("docs", "documents") => {
+            entity.insert("documentId".to_string(), Value::String(file_id.to_string()));
+        }
+        ("sheets", "spreadsheets") => {
+            entity.insert(
+                "spreadsheetId".to_string(),
+                Value::String(file_id.to_string()),
+            );
+        }
+        _ => {
+            entity.insert("id".to_string(), Value::String(file_id.to_string()));
+        }
+    }
+    entity.insert("driveLabels".to_string(), label_list.clone());
+
+    let classification_values = derive_classification_label_values_from_label_list(&label_list);
+    if !classification_values.is_empty() {
+        entity.insert(
+            "classificationLabelValue".to_string(),
+            Value::Array(
+                classification_values
+                    .into_iter()
+                    .map(Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+
+    Value::Object(entity)
+}
+
+async fn fetch_drive_label_list(
+    file_id: &str,
+    token: Option<&str>,
+    auth_method: &AuthMethod,
+) -> Option<Value> {
+    let token = match (auth_method, token) {
+        (AuthMethod::OAuth, Some(t)) => t,
+        _ => return None,
+    };
+
+    let client = crate::client::build_client().ok()?;
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}/listLabels",
+        crate::validate::encode_path_segment(file_id)
+    );
+    let mut request = client.get(url).bearer_auth(token);
+    if let Some(quota_project) = crate::auth::get_quota_project() {
+        request = request.header("x-goog-user-project", quota_project);
+    }
+
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(
+            target: "gws::file_audit",
+            file_id = %file_id,
+            status = response.status().as_u16(),
+            "Drive label enrichment request was not successful"
+        );
+        return None;
+    }
+
+    response.json::<Value>().await.ok()
+}
+
+async fn build_additional_touched_entities(
+    ctx: &FileAuditContext,
+    token: Option<&str>,
+    auth_method: &AuthMethod,
+) -> Vec<Value> {
+    if !should_fetch_drive_label_enrichment(ctx) {
+        return Vec::new();
+    }
+
+    let Some(file_id) = ctx.request_ids.first().cloned() else {
+        return Vec::new();
+    };
+
+    let Some(label_list) = fetch_drive_label_list(&file_id, token, auth_method).await else {
+        return Vec::new();
+    };
+
+    vec![build_drive_label_enrichment_entity(
+        ctx, &file_id, label_list,
+    )]
+}
+
+fn extract_docs_document_metadata(doc_value: &Value) -> Option<Value> {
+    let Value::Object(obj) = doc_value else {
+        return None;
+    };
+
+    let mut metadata = Map::new();
+    for key in ["documentId", "title", "revisionId"] {
+        if let Some(value) = obj.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn extract_docs_touched_documents(response_json: &Value) -> Vec<Value> {
+    let mut touched = Vec::new();
+
+    if let Some(docs) = response_json.get("documents").and_then(|v| v.as_array()) {
+        for doc in docs {
+            if let Some(meta) = extract_docs_document_metadata(doc) {
+                touched.push(meta);
+            }
+        }
+        return touched;
+    }
+
+    if let Some(meta) = extract_docs_document_metadata(response_json) {
+        touched.push(meta);
+    }
+
+    touched
+}
+
+fn extract_sheets_spreadsheet_metadata(sheet_value: &Value) -> Option<Value> {
+    let Value::Object(obj) = sheet_value else {
+        return None;
+    };
+
+    let mut metadata = Map::new();
+    for key in ["spreadsheetId", "spreadsheetUrl"] {
+        if let Some(value) = obj.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if let Some(title) = obj
+        .get("properties")
+        .and_then(|p| p.get("title"))
+        .or_else(|| obj.get("title"))
+    {
+        metadata.insert("title".to_string(), title.clone());
+    }
+
+    if let Some(updates) = obj.get("updates") {
+        metadata.insert("updates".to_string(), updates.clone());
+    }
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn extract_sheets_touched_spreadsheets(response_json: &Value) -> Vec<Value> {
+    let mut touched = Vec::new();
+
+    if let Some(sheets) = response_json.get("spreadsheets").and_then(|v| v.as_array()) {
+        for sheet in sheets {
+            if let Some(meta) = extract_sheets_spreadsheet_metadata(sheet) {
+                touched.push(meta);
+            }
+        }
+    }
+
+    if let Some(updated) = response_json.get("updatedSpreadsheet") {
+        if let Some(meta) = extract_sheets_spreadsheet_metadata(updated) {
+            touched.push(meta);
+        }
+    }
+
+    if let Some(meta) = extract_sheets_spreadsheet_metadata(response_json) {
+        touched.push(meta);
+    }
+
+    touched
+}
+
+fn extract_touched_entities(service: &str, resource: &str, response_json: &Value) -> Vec<Value> {
+    match (service, resource) {
+        ("drive", "files") => extract_drive_touched_files(response_json),
+        ("docs", "documents") => extract_docs_touched_documents(response_json),
+        ("sheets", "spreadsheets") => extract_sheets_touched_spreadsheets(response_json),
+        _ => Vec::new(),
+    }
+}
+
+fn file_audit_log_path() -> PathBuf {
+    if let Ok(path) = std::env::var(FILE_AUDIT_LOG_ENV) {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    crate::auth_commands::config_dir().join(FILE_AUDIT_LOG_DEFAULT_FILE)
+}
+
+async fn append_file_audit_event(event: &Value) -> Result<(), anyhow::Error> {
+    let path = file_audit_log_path();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!("failed to create file audit log dir '{}'", parent.display())
+        })?;
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("failed to open file audit log '{}'", path.display()))?;
+
+    let mut line = serde_json::to_vec(event).context("failed to serialize file audit event")?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .await
+        .with_context(|| format!("failed to append file audit log '{}'", path.display()))?;
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush file audit log '{}'", path.display()))?;
+    Ok(())
+}
+
+fn build_file_audit_context(
+    doc: &RestDescription,
+    method: &RestMethod,
+    input: &ExecutionInput,
+    upload: &Option<UploadSource<'_>>,
+) -> Option<FileAuditContext> {
+    let (service, resource, id_keys): (&str, &str, &[&str]) = if is_drive_files_method(doc, method)
+    {
+        ("drive", "files", &["fileId"])
+    } else if is_docs_documents_method(doc, method) {
+        ("docs", "documents", &["documentId"])
+    } else if is_sheets_spreadsheets_method(doc, method) {
+        ("sheets", "spreadsheets", &["spreadsheetId"])
+    } else {
+        return None;
+    };
+
+    let method_id = method
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("{service}.{resource}.unknown"));
+
+    let upload_source = upload.as_ref().map(|source| match source {
+        UploadSource::File { path, .. } => (*path).to_string(),
+        UploadSource::Bytes { .. } => "in-memory-bytes".to_string(),
+    });
+
+    Some(FileAuditContext {
+        service: service.to_string(),
+        resource: resource.to_string(),
+        operation: classify_file_operation(
+            service,
+            &method_id,
+            &method.http_method,
+            &input.query_params,
+        ),
+        method_id,
+        http_method: method.http_method.clone(),
+        request_ids: extract_request_ids(method, &input.params, id_keys),
+        request_metadata: extract_request_metadata(input.body.as_ref()),
+        upload_source,
+    })
+}
+
+async fn emit_file_audit_event(
+    ctx: &FileAuditContext,
+    status: u16,
+    content_type: &str,
+    response_json: Option<&Value>,
+    extra_touched_entities: &[Value],
+) {
+    let mut touched_entities = response_json
+        .map(|json| extract_touched_entities(&ctx.service, &ctx.resource, json))
+        .unwrap_or_default();
+    touched_entities.extend(extra_touched_entities.iter().cloned());
+    let audit_path = file_audit_log_path();
+    let event = json!({
+        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "service": ctx.service,
+        "resource": ctx.resource,
+        "operation": ctx.operation,
+        "methodId": ctx.method_id,
+        "httpMethod": ctx.http_method,
+        "status": status,
+        "contentType": content_type,
+        "requestIds": ctx.request_ids,
+        "requestMetadata": ctx.request_metadata,
+        "uploadSource": ctx.upload_source,
+        "touchedEntities": touched_entities,
+    });
+
+    tracing::info!(
+        target: "gws::file_audit",
+        service = %ctx.service,
+        resource = %ctx.resource,
+        method_id = %ctx.method_id,
+        operation = %ctx.operation,
+        status = status,
+        touched_entities = event
+            .get("touchedEntities")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+            .unwrap_or(0),
+        "File audit event"
+    );
+
+    if let Err(err) = append_file_audit_event(&event).await {
+        tracing::warn!(
+            target: "gws::file_audit",
+            service = %ctx.service,
+            resource = %ctx.resource,
+            method_id = %ctx.method_id,
+            operation = %ctx.operation,
+            log_path = %audit_path.display(),
+            error = %err,
+            "Failed to append file audit event"
+        );
+    }
 }
 
 /// Parse parameters and body JSON, validate against schema, check required params, and build the URL.
@@ -251,7 +870,7 @@ async fn handle_json_response(
     page_token: &mut Option<String>,
     capture_output: bool,
     captured: &mut Vec<Value>,
-) -> Result<bool, GwsError> {
+) -> Result<(bool, Option<Value>), GwsError> {
     if let Ok(mut json_val) = serde_json::from_str::<Value>(body_text) {
         *pages_fetched += 1;
 
@@ -322,10 +941,11 @@ async fn handle_json_response(
                         ))
                         .await;
                     }
-                    return Ok(true); // continue paginating
+                    return Ok((true, Some(json_val))); // continue paginating
                 }
             }
         }
+        return Ok((false, Some(json_val)));
     } else {
         // Not valid JSON, output as-is
         if !capture_output && !body_text.is_empty() {
@@ -333,7 +953,7 @@ async fn handle_json_response(
         }
     }
 
-    Ok(false)
+    Ok((false, None))
 }
 
 /// Handle a binary response by streaming it to a file.
@@ -412,6 +1032,7 @@ pub async fn execute_method(
     capture_output: bool,
 ) -> Result<Option<Value>, GwsError> {
     let input = parse_and_validate_inputs(doc, method, params_json, body_json, upload.is_some())?;
+    let file_audit_ctx = build_file_audit_context(doc, method, &input, &upload);
 
     if dry_run {
         let dry_run_info = json!({
@@ -495,7 +1116,7 @@ pub async fn execute_method(
                 .await
                 .context("Failed to read response body")?;
 
-            let should_continue = handle_json_response(
+            let (should_continue, parsed_json) = handle_json_response(
                 &body_text,
                 pagination,
                 sanitize_template,
@@ -508,19 +1129,41 @@ pub async fn execute_method(
             )
             .await?;
 
+            if let Some(ctx) = &file_audit_ctx {
+                let extra_touched =
+                    build_additional_touched_entities(ctx, token, &auth_method).await;
+                emit_file_audit_event(
+                    ctx,
+                    status.as_u16(),
+                    &content_type,
+                    parsed_json.as_ref(),
+                    &extra_touched,
+                )
+                .await;
+            }
+
             if should_continue {
                 continue;
             }
-        } else if let Some(res) = handle_binary_response(
-            response,
-            &content_type,
-            output_path,
-            output_format,
-            capture_output,
-        )
-        .await?
-        {
-            captured_values.push(res);
+        } else {
+            if let Some(res) = handle_binary_response(
+                response,
+                &content_type,
+                output_path,
+                output_format,
+                capture_output,
+            )
+            .await?
+            {
+                captured_values.push(res);
+            }
+
+            if let Some(ctx) = &file_audit_ctx {
+                let extra_touched =
+                    build_additional_touched_entities(ctx, token, &auth_method).await;
+                emit_file_audit_event(ctx, status.as_u16(), &content_type, None, &extra_touched)
+                    .await;
+            }
         }
 
         break;
@@ -1193,6 +1836,30 @@ mod tests {
         JsonSchema, JsonSchemaProperty, MethodParameter, RestDescription, RestMethod,
     };
     use serde_json::json;
+    use serial_test::serial;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn test_pagination_config_default() {
@@ -1207,6 +1874,223 @@ mod tests {
         assert_eq!(AuthMethod::OAuth, AuthMethod::OAuth);
         assert_eq!(AuthMethod::None, AuthMethod::None);
         assert_ne!(AuthMethod::OAuth, AuthMethod::None);
+    }
+
+    #[test]
+    fn test_classify_file_operation_drive_download() {
+        let op = classify_file_operation(
+            "drive",
+            "drive.files.get",
+            "GET",
+            &[("alt".to_string(), "media".to_string())],
+        );
+        assert_eq!(op, "download");
+    }
+
+    #[test]
+    fn test_extract_request_ids_from_path_param() {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "fileId".to_string(),
+            MethodParameter {
+                location: Some("path".to_string()),
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            parameters,
+            ..Default::default()
+        };
+        let mut params = Map::new();
+        params.insert("fileId".to_string(), json!("abc123"));
+
+        let ids = extract_request_ids(&method, &params, &["fileId"]);
+        assert_eq!(ids, vec!["abc123".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_drive_touched_files_includes_label_info() {
+        let payload = json!({
+            "files": [{
+                "id": "f1",
+                "name": "Spec",
+                "labelInfo": {
+                    "labels": [{
+                        "id": "lbl_1",
+                        "name": "Priority"
+                    }]
+                }
+            }]
+        });
+
+        let touched = extract_drive_touched_files(&payload);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0]["id"], "f1");
+        assert!(touched[0].get("labelInfo").is_some());
+    }
+
+    #[test]
+    fn test_derive_classification_label_values_from_label_list() {
+        let payload = json!({
+            "labels": [{
+                "fields": {
+                    "fld": {
+                        "selection": ["OPT_A", "OPT_B"],
+                        "text": ["Internal - DSS-2"]
+                    }
+                }
+            }]
+        });
+
+        let values = derive_classification_label_values_from_label_list(&payload);
+        assert!(values.contains(&"OPT_A".to_string()));
+        assert!(values.contains(&"OPT_B".to_string()));
+        assert!(values.contains(&"Internal - DSS-2".to_string()));
+    }
+
+    #[test]
+    fn test_build_file_audit_context_identifies_drive_files() {
+        let doc = RestDescription {
+            name: "drive".to_string(),
+            ..Default::default()
+        };
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "fileId".to_string(),
+            MethodParameter {
+                location: Some("path".to_string()),
+                ..Default::default()
+            },
+        );
+        let method = RestMethod {
+            id: Some("drive.files.get".to_string()),
+            http_method: "GET".to_string(),
+            path: "files/{fileId}".to_string(),
+            parameters,
+            ..Default::default()
+        };
+        let mut params = Map::new();
+        params.insert("fileId".to_string(), json!("f123"));
+        params.insert("alt".to_string(), json!("media"));
+        let input = ExecutionInput {
+            params,
+            body: None,
+            full_url: "https://www.googleapis.com/drive/v3/files/f123".to_string(),
+            query_params: vec![("alt".to_string(), "media".to_string())],
+            is_upload: false,
+        };
+
+        let ctx = build_file_audit_context(&doc, &method, &input, &None)
+            .expect("drive files method should produce audit context");
+        assert_eq!(ctx.operation, "download");
+        assert_eq!(ctx.request_ids, vec!["f123".to_string()]);
+        assert_eq!(ctx.service, "drive");
+        assert_eq!(ctx.resource, "files");
+    }
+
+    #[test]
+    fn test_build_file_audit_context_identifies_docs_documents() {
+        let doc = RestDescription {
+            name: "docs".to_string(),
+            ..Default::default()
+        };
+        let method = RestMethod {
+            id: Some("docs.documents.batchUpdate".to_string()),
+            http_method: "POST".to_string(),
+            path: "v1/documents/{documentId}:batchUpdate".to_string(),
+            ..Default::default()
+        };
+        let mut params = Map::new();
+        params.insert("documentId".to_string(), json!("doc-1"));
+        let input = ExecutionInput {
+            params,
+            body: Some(json!({"title":"Spec"})),
+            full_url: "https://docs.googleapis.com/v1/documents/doc-1:batchUpdate".to_string(),
+            query_params: Vec::new(),
+            is_upload: false,
+        };
+
+        let ctx = build_file_audit_context(&doc, &method, &input, &None)
+            .expect("docs documents method should produce audit context");
+        assert_eq!(ctx.service, "docs");
+        assert_eq!(ctx.resource, "documents");
+        assert_eq!(ctx.operation, "update");
+        assert_eq!(ctx.request_ids, vec!["doc-1".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_touched_entities_for_sheets_response() {
+        let response = json!({
+            "spreadsheetId": "sheet-1",
+            "updates": {
+                "updatedCells": 3
+            }
+        });
+        let touched = extract_touched_entities("sheets", "spreadsheets", &response);
+        assert_eq!(touched[0]["spreadsheetId"], "sheet-1");
+        assert!(touched[0].get("updates").is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_append_file_audit_event_writes_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("file-audit.jsonl");
+        let _guard = EnvVarGuard::set(FILE_AUDIT_LOG_ENV, log_path.as_os_str());
+
+        let event = json!({
+            "operation": "create",
+            "requestIds": ["f1"]
+        });
+        append_file_audit_event(&event).await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert!(contents.contains("\"operation\":\"create\""));
+        assert!(contents.contains("\"requestIds\":[\"f1\"]"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_emit_file_audit_event_serializes_touched_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit/events.jsonl");
+        let _guard = EnvVarGuard::set(FILE_AUDIT_LOG_ENV, log_path.as_os_str());
+
+        let ctx = FileAuditContext {
+            service: "drive".to_string(),
+            resource: "files".to_string(),
+            operation: "update".to_string(),
+            method_id: "drive.files.update".to_string(),
+            http_method: "PATCH".to_string(),
+            request_ids: vec!["file-1".to_string()],
+            request_metadata: Some(json!({"name": "Draft"})),
+            upload_source: None,
+        };
+        let response = json!({
+            "id": "file-1",
+            "name": "Draft",
+            "mimeType": "application/vnd.google-apps.document",
+            "labelInfo": {"labels":[{"id":"lbl"}]}
+        });
+
+        let extra = vec![json!({
+            "id": "file-1",
+            "classificationLabelValue": ["OPT_A"]
+        })];
+
+        emit_file_audit_event(&ctx, 200, "application/json", Some(&response), &extra).await;
+
+        let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let first_line = contents.lines().next().unwrap();
+        let parsed: Value = serde_json::from_str(first_line).unwrap();
+        assert_eq!(parsed["operation"], "update");
+        assert_eq!(parsed["requestIds"][0], "file-1");
+        assert_eq!(parsed["touchedEntities"][0]["id"], "file-1");
+        assert!(parsed["touchedEntities"][0].get("labelInfo").is_some());
+        assert_eq!(
+            parsed["touchedEntities"][1]["classificationLabelValue"][0],
+            "OPT_A"
+        );
     }
 
     #[test]
