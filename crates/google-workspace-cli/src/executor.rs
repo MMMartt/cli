@@ -375,7 +375,9 @@ fn derive_classification_label_values_from_label_list(label_list: &Value) -> Vec
 fn should_fetch_drive_label_enrichment(ctx: &FileAuditContext) -> bool {
     (ctx.service == "docs" && ctx.resource == "documents")
         || (ctx.service == "sheets" && ctx.resource == "spreadsheets")
-        || (ctx.service == "drive" && ctx.resource == "files" && ctx.operation == "modify_labels")
+        || (ctx.service == "drive"
+            && ctx.resource == "files"
+            && (ctx.operation == "modify_labels" || ctx.method_id == "drive.files.export"))
 }
 
 fn build_drive_label_enrichment_entity(
@@ -1946,6 +1948,21 @@ mod tests {
         assert!(values.contains(&"OPT_A".to_string()));
         assert!(values.contains(&"OPT_B".to_string()));
         assert!(values.contains(&"Internal - DSS-2".to_string()));
+    }
+
+    #[test]
+    fn test_should_fetch_drive_label_enrichment_for_export() {
+        let ctx = FileAuditContext {
+            service: "drive".to_string(),
+            resource: "files".to_string(),
+            operation: "export".to_string(),
+            method_id: "drive.files.export".to_string(),
+            http_method: "GET".to_string(),
+            request_ids: vec!["file-1".to_string()],
+            request_metadata: None,
+            upload_source: None,
+        };
+        assert!(should_fetch_drive_label_enrichment(&ctx));
     }
 
     #[test]
