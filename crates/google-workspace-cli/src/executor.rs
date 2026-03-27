@@ -373,11 +373,31 @@ fn derive_classification_label_values_from_label_list(label_list: &Value) -> Vec
 }
 
 fn should_fetch_drive_label_enrichment(ctx: &FileAuditContext) -> bool {
-    (ctx.service == "docs" && ctx.resource == "documents")
+    if (ctx.service == "docs" && ctx.resource == "documents")
         || (ctx.service == "sheets" && ctx.resource == "spreadsheets")
-        || (ctx.service == "drive"
-            && ctx.resource == "files"
-            && (ctx.operation == "modify_labels" || ctx.method_id == "drive.files.export"))
+    {
+        return true;
+    }
+
+    if !(ctx.service == "drive" && ctx.resource == "files") {
+        return false;
+    }
+
+    if ctx.request_ids.is_empty() {
+        return false;
+    }
+
+    // Skip collection/listing endpoints that either don't target a concrete file
+    // or already return label payloads directly.
+    let method_id = ctx.method_id.to_ascii_lowercase();
+    !matches!(
+        method_id.as_str(),
+        "drive.files.list"
+            | "drive.files.listlabels"
+            | "drive.files.generateids"
+            | "drive.files.emptytrash"
+            | "drive.files.watch"
+    )
 }
 
 fn build_drive_label_enrichment_entity(
@@ -1963,6 +1983,36 @@ mod tests {
             upload_source: None,
         };
         assert!(should_fetch_drive_label_enrichment(&ctx));
+    }
+
+    #[test]
+    fn test_should_fetch_drive_label_enrichment_for_drive_get() {
+        let ctx = FileAuditContext {
+            service: "drive".to_string(),
+            resource: "files".to_string(),
+            operation: "get".to_string(),
+            method_id: "drive.files.get".to_string(),
+            http_method: "GET".to_string(),
+            request_ids: vec!["file-1".to_string()],
+            request_metadata: None,
+            upload_source: None,
+        };
+        assert!(should_fetch_drive_label_enrichment(&ctx));
+    }
+
+    #[test]
+    fn test_should_not_fetch_drive_label_enrichment_for_listlabels() {
+        let ctx = FileAuditContext {
+            service: "drive".to_string(),
+            resource: "files".to_string(),
+            operation: "read".to_string(),
+            method_id: "drive.files.listLabels".to_string(),
+            http_method: "GET".to_string(),
+            request_ids: vec!["file-1".to_string()],
+            request_metadata: None,
+            upload_source: None,
+        };
+        assert!(!should_fetch_drive_label_enrichment(&ctx));
     }
 
     #[test]
