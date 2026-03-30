@@ -94,7 +94,9 @@ struct ExecutionInput {
 
 const FILE_AUDIT_LOG_ENV: &str = "GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE";
 const FILE_AUDIT_ENABLED_ENV: &str = "GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED";
+const FILE_AUDIT_MAX_BYTES_ENV: &str = "GOOGLE_WORKSPACE_CLI_FILE_AUDIT_MAX_BYTES";
 const FILE_AUDIT_LOG_DEFAULT_FILE: &str = "file-ops-audit.jsonl";
+const FILE_AUDIT_MAX_BYTES_DEFAULT: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct FileAuditContext {
@@ -119,6 +121,14 @@ fn is_file_audit_enabled() -> bool {
     std::env::var(FILE_AUDIT_ENABLED_ENV)
         .ok()
         .is_some_and(|v| is_truthy_env_value(&v))
+}
+
+fn file_audit_max_bytes() -> u64 {
+    std::env::var(FILE_AUDIT_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(FILE_AUDIT_MAX_BYTES_DEFAULT)
 }
 
 fn is_drive_files_method(doc: &RestDescription, method: &RestMethod) -> bool {
@@ -739,6 +749,55 @@ fn file_audit_log_path() -> PathBuf {
     crate::auth_commands::config_dir().join(FILE_AUDIT_LOG_DEFAULT_FILE)
 }
 
+fn file_audit_old_path(path: &PathBuf) -> PathBuf {
+    let mut old_path = path.as_os_str().to_os_string();
+    old_path.push(".old");
+    PathBuf::from(old_path)
+}
+
+async fn rotate_file_audit_log_if_needed(
+    path: &PathBuf,
+    incoming_bytes: usize,
+    max_bytes: u64,
+) -> Result<(), anyhow::Error> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to stat file audit log '{}'", path.display()))
+        }
+    };
+
+    if metadata.len().saturating_add(incoming_bytes as u64) <= max_bytes {
+        return Ok(());
+    }
+
+    let old_path = file_audit_old_path(path);
+    match tokio::fs::remove_file(&old_path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove previous rotated file audit log '{}'",
+                    old_path.display()
+                )
+            })
+        }
+    }
+
+    tokio::fs::rename(path, &old_path).await.with_context(|| {
+        format!(
+            "failed to rotate file audit log '{}' to '{}'",
+            path.display(),
+            old_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 async fn append_file_audit_event(event: &Value) -> Result<(), anyhow::Error> {
     let path = file_audit_log_path();
     if let Some(parent) = path.parent() {
@@ -747,6 +806,11 @@ async fn append_file_audit_event(event: &Value) -> Result<(), anyhow::Error> {
         })?;
     }
 
+    let mut line = serde_json::to_vec(event).context("failed to serialize file audit event")?;
+    line.push(b'\n');
+
+    rotate_file_audit_log_if_needed(&path, line.len(), file_audit_max_bytes()).await?;
+
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -754,8 +818,6 @@ async fn append_file_audit_event(event: &Value) -> Result<(), anyhow::Error> {
         .await
         .with_context(|| format!("failed to open file audit log '{}'", path.display()))?;
 
-    let mut line = serde_json::to_vec(event).context("failed to serialize file audit event")?;
-    line.push(b'\n');
     file.write_all(&line)
         .await
         .with_context(|| format!("failed to append file audit log '{}'", path.display()))?;
@@ -2062,6 +2124,18 @@ mod tests {
     }
 
     #[test]
+    fn test_file_audit_max_bytes_env() {
+        let _guard = EnvVarGuard::set(FILE_AUDIT_MAX_BYTES_ENV, "2048");
+        assert_eq!(file_audit_max_bytes(), 2048);
+    }
+
+    #[test]
+    fn test_file_audit_max_bytes_defaults_for_invalid_value() {
+        let _guard = EnvVarGuard::set(FILE_AUDIT_MAX_BYTES_ENV, "not-a-number");
+        assert_eq!(file_audit_max_bytes(), FILE_AUDIT_MAX_BYTES_DEFAULT);
+    }
+
+    #[test]
     fn test_classify_file_operation_drive_download() {
         let op = classify_file_operation(
             "drive",
@@ -2393,6 +2467,54 @@ mod tests {
         let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
         assert!(contents.contains("\"operation\":\"create\""));
         assert!(contents.contains("\"requestIds\":[\"f1\"]"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_append_file_audit_event_rotates_to_old_when_size_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("file-audit.jsonl");
+        let old_path = file_audit_old_path(&log_path);
+        let _log_guard = EnvVarGuard::set(FILE_AUDIT_LOG_ENV, log_path.as_os_str());
+        let _size_guard = EnvVarGuard::set(FILE_AUDIT_MAX_BYTES_ENV, "1");
+
+        append_file_audit_event(&json!({"requestIds":["first"]}))
+            .await
+            .unwrap();
+        append_file_audit_event(&json!({"requestIds":["second"]}))
+            .await
+            .unwrap();
+
+        let current_contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let old_contents = tokio::fs::read_to_string(&old_path).await.unwrap();
+        assert!(current_contents.contains("\"second\""));
+        assert!(old_contents.contains("\"first\""));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_append_file_audit_event_rotation_replaces_existing_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("file-audit.jsonl");
+        let old_path = file_audit_old_path(&log_path);
+        let _log_guard = EnvVarGuard::set(FILE_AUDIT_LOG_ENV, log_path.as_os_str());
+        let _size_guard = EnvVarGuard::set(FILE_AUDIT_MAX_BYTES_ENV, "1");
+
+        append_file_audit_event(&json!({"requestIds":["first"]}))
+            .await
+            .unwrap();
+        append_file_audit_event(&json!({"requestIds":["second"]}))
+            .await
+            .unwrap();
+        append_file_audit_event(&json!({"requestIds":["third"]}))
+            .await
+            .unwrap();
+
+        let current_contents = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let old_contents = tokio::fs::read_to_string(&old_path).await.unwrap();
+        assert!(current_contents.contains("\"third\""));
+        assert!(old_contents.contains("\"second\""));
+        assert!(!old_contents.contains("\"first\""));
     }
 
     #[tokio::test]

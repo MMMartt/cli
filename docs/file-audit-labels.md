@@ -34,6 +34,8 @@ For label-aware scenarios, `touchedEntities` includes:
 
 - Env var override: `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE`
 - Default path: `~/.config/gws/file-ops-audit.jsonl`
+- Max size before rotate: `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_MAX_BYTES` (default `10485760`, 10 MiB)
+- Rotation behavior: when appending would exceed max size, current file is moved to `<log>.old` and any existing `<log>.old` is deleted first (only one backup is kept)
 
 ## Quick Local Test (Token-Only)
 

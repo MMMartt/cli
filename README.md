@@ -391,6 +391,7 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `GOOGLE_WORKSPACE_CLI_LOG_FILE` | Directory for JSON log files with daily rotation. Off by default. |
 | `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED` | Enable file operation audit logs (`1`, `true`, `on`, `yes`). Off by default. |
 | `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE` | File path for file operation audit logs (Drive/Docs/Sheets/Slides/Forms, JSONL). Used only when audit is enabled. Default: `~/.config/gws/file-ops-audit.jsonl` |
+| `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_MAX_BYTES` | Max size in bytes before file audit log rotates (`<log>.old`), replacing any previous `.old`. Default: `10485760` (10 MiB). |
 | `GOOGLE_WORKSPACE_PROJECT_ID` | GCP project ID override for quota/billing and fallback for helper commands |
 
 Environment variables can also be set in a `.env` file (loaded via [dotenvy](https://crates.io/crates/dotenvy)).

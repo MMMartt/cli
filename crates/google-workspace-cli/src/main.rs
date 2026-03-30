@@ -511,6 +511,9 @@ fn print_usage() {
     println!(
         "    GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE   File path for file-op audit logs (Drive/Docs/Sheets/Slides/Forms, JSONL)"
     );
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_FILE_AUDIT_MAX_BYTES  Max bytes before file-op audit log rotates to <file>.old (default: 10485760)"
+    );
     println!();
     println!("EXIT CODES:");
     for (code, description) in crate::error::EXIT_CODE_DOCUMENTATION {
