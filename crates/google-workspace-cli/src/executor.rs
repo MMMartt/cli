@@ -93,6 +93,7 @@ struct ExecutionInput {
 }
 
 const FILE_AUDIT_LOG_ENV: &str = "GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE";
+const FILE_AUDIT_ENABLED_ENV: &str = "GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED";
 const FILE_AUDIT_LOG_DEFAULT_FILE: &str = "file-ops-audit.jsonl";
 
 #[derive(Debug, Clone)]
@@ -105,6 +106,19 @@ struct FileAuditContext {
     request_ids: Vec<String>,
     request_metadata: Option<Value>,
     upload_source: Option<String>,
+}
+
+fn is_truthy_env_value(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn is_file_audit_enabled() -> bool {
+    std::env::var(FILE_AUDIT_ENABLED_ENV)
+        .ok()
+        .is_some_and(|v| is_truthy_env_value(&v))
 }
 
 fn is_drive_files_method(doc: &RestDescription, method: &RestMethod) -> bool {
@@ -1177,7 +1191,11 @@ pub async fn execute_method(
     capture_output: bool,
 ) -> Result<Option<Value>, GwsError> {
     let input = parse_and_validate_inputs(doc, method, params_json, body_json, upload.is_some())?;
-    let file_audit_ctx = build_file_audit_context(doc, method, &input, &upload);
+    let file_audit_ctx = if is_file_audit_enabled() {
+        build_file_audit_context(doc, method, &input, &upload)
+    } else {
+        None
+    };
 
     if dry_run {
         let dry_run_info = json!({
@@ -2019,6 +2037,28 @@ mod tests {
         assert_eq!(AuthMethod::OAuth, AuthMethod::OAuth);
         assert_eq!(AuthMethod::None, AuthMethod::None);
         assert_ne!(AuthMethod::OAuth, AuthMethod::None);
+    }
+
+    #[test]
+    fn test_is_truthy_env_value() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(is_truthy_env_value(v), "expected truthy for {v}");
+        }
+        for v in ["", "0", "false", "off", "no", "random"] {
+            assert!(!is_truthy_env_value(v), "expected falsy for {v}");
+        }
+    }
+
+    #[test]
+    fn test_is_file_audit_enabled_env() {
+        let _guard = EnvVarGuard::set(FILE_AUDIT_ENABLED_ENV, "1");
+        assert!(is_file_audit_enabled());
+    }
+
+    #[test]
+    fn test_is_file_audit_disabled_when_env_false() {
+        let _guard = EnvVarGuard::set(FILE_AUDIT_ENABLED_ENV, "0");
+        assert!(!is_file_audit_enabled());
     }
 
     #[test]

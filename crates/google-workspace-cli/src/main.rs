@@ -174,6 +174,12 @@ async fn run() -> Result<(), GwsError> {
         GwsError::Validation(e.to_string())
     })?;
 
+    // File audit is opt-in. Enabling via CLI flag sets a process env var so
+    // helper commands (which call executor internally) inherit the same behavior.
+    if matches.get_flag("enable-file-audit") {
+        std::env::set_var("GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED", "1");
+    }
+
     // Resolve --format flag
     let output_format = match matches.get_one::<String>("format") {
         Some(s) => match formatter::OutputFormat::parse(s) {
@@ -458,6 +464,7 @@ fn print_usage() {
     println!("    --upload-content-type <MIME>  MIME type of the uploaded file (auto-detected from extension if omitted)");
     println!("    --output <PATH>       Output file path for binary responses");
     println!("    --format <FMT>        Output format: json (default), table, yaml, csv");
+    println!("    --enable-file-audit   Enable file operation audit logging (default: off)");
     println!("    --api-version <VER>   Override the API version (e.g., v2, v3)");
     println!("    --page-all            Auto-paginate, one JSON line per page (NDJSON)");
     println!("    --page-limit <N>      Max pages to fetch with --page-all (default: 10)");
@@ -497,6 +504,9 @@ fn print_usage() {
     println!("    GOOGLE_WORKSPACE_CLI_LOG                 Log level for stderr (e.g., gws=debug)");
     println!(
         "    GOOGLE_WORKSPACE_CLI_LOG_FILE            Directory for JSON log files (daily rotation)"
+    );
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED   Enable file-op audit logs (set to 1/true/on/yes)"
     );
     println!(
         "    GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE   File path for file-op audit logs (Drive/Docs/Sheets/Slides/Forms, JSONL)"

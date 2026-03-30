@@ -4,7 +4,14 @@ This document explains the new file-operation audit log behavior and a quick loc
 
 ## What This Feature Logs
 
-When `gws` calls file-related APIs, it appends one JSON line per successful request:
+Audit logging is off by default.
+
+Enable it with either:
+
+- CLI flag: `--enable-file-audit`
+- Env var: `GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED=1` (also accepts `true`, `on`, `yes`)
+
+When enabled, `gws` appends one JSON line per successful file-related request:
 
 - `drive.files.*`
 - `docs.documents.*`
@@ -36,12 +43,13 @@ Use token auth only (no local login state):
 export GOOGLE_WORKSPACE_CLI_TOKEN="<ACCESS_TOKEN>"
 export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="/tmp/gws-token-only"
 export GOOGLE_APPLICATION_CREDENTIALS="/tmp/does-not-exist-adc.json"
+export GOOGLE_WORKSPACE_CLI_FILE_AUDIT_ENABLED="1"
 export GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE="/tmp/gws-audit.jsonl"
 
 : > "$GOOGLE_WORKSPACE_CLI_FILE_AUDIT_LOG_FILE"
 
 # Example: query known DSS files
-target/debug/gws drive files list --params '{"q":"name = \"dss1\" or name = \"dss2\" or name = \"dss3\" or name = \"dss4\"","fields":"files(id,name)","pageSize":50}'
+target/debug/gws drive files list --enable-file-audit --params '{"q":"name = \"dss1\" or name = \"dss2\" or name = \"dss3\" or name = \"dss4\"","fields":"files(id,name)","pageSize":50}'
 
 # Example: read labels for one file
 target/debug/gws drive files listLabels --params '{"fileId":"<FILE_ID>"}'

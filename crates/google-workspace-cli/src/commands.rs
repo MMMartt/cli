@@ -46,6 +46,13 @@ pub fn build_cli(doc: &RestDescription) -> Command {
                 .help("Output format: json (default), table, yaml, csv")
                 .value_name("FORMAT")
                 .global(true),
+        )
+        .arg(
+            clap::Arg::new("enable-file-audit")
+                .long("enable-file-audit")
+                .help("Enable file operation audit logging (off by default)")
+                .action(clap::ArgAction::SetTrue)
+                .global(true),
         );
 
     // Inject helper commands
@@ -277,6 +284,19 @@ mod tests {
         assert!(
             sanitize_arg.is_some(),
             "--sanitize arg should be present on root command"
+        );
+    }
+
+    #[test]
+    fn test_enable_file_audit_arg_present() {
+        let doc = make_doc();
+        let cmd = build_cli(&doc);
+
+        let args: Vec<_> = cmd.get_arguments().collect();
+        let audit_arg = args.iter().find(|a| a.get_id() == "enable-file-audit");
+        assert!(
+            audit_arg.is_some(),
+            "--enable-file-audit arg should be present on root command"
         );
     }
 }
