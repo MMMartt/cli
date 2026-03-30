@@ -1,4 +1,4 @@
-# File Audit Log (Drive/Docs/Sheets)
+# File Audit Log (Drive/Docs/Sheets/Slides/Forms)
 
 This document explains the new file-operation audit log behavior and a quick local test flow.
 
@@ -9,6 +9,8 @@ When `gws` calls file-related APIs, it appends one JSON line per successful requ
 - `drive.files.*`
 - `docs.documents.*`
 - `sheets.spreadsheets.*`
+- `slides.presentations.*`
+- `forms.forms.*`
 
 Each event includes:
 

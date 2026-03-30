@@ -134,6 +134,24 @@ fn is_sheets_spreadsheets_method(doc: &RestDescription, method: &RestMethod) -> 
             .unwrap_or_else(|| method.path.contains("spreadsheets"))
 }
 
+fn is_slides_presentations_method(doc: &RestDescription, method: &RestMethod) -> bool {
+    doc.name == "slides"
+        && method
+            .id
+            .as_deref()
+            .map(|id| id.starts_with("slides.presentations."))
+            .unwrap_or_else(|| method.path.contains("presentations"))
+}
+
+fn is_forms_forms_method(doc: &RestDescription, method: &RestMethod) -> bool {
+    doc.name == "forms"
+        && method
+            .id
+            .as_deref()
+            .map(|id| id.starts_with("forms.forms."))
+            .unwrap_or_else(|| method.path.contains("forms"))
+}
+
 fn classify_file_operation(
     service: &str,
     method_id: &str,
@@ -248,6 +266,9 @@ fn extract_request_metadata(body: Option<&Value>) -> Option<Value> {
         "fileId",
         "documentId",
         "spreadsheetId",
+        "presentationId",
+        "formId",
+        "scriptId",
         "name",
         "title",
         "range",
@@ -375,6 +396,8 @@ fn derive_classification_label_values_from_label_list(label_list: &Value) -> Vec
 fn should_fetch_drive_label_enrichment(ctx: &FileAuditContext) -> bool {
     if (ctx.service == "docs" && ctx.resource == "documents")
         || (ctx.service == "sheets" && ctx.resource == "spreadsheets")
+        || (ctx.service == "slides" && ctx.resource == "presentations")
+        || (ctx.service == "forms" && ctx.resource == "forms")
     {
         return true;
     }
@@ -415,6 +438,15 @@ fn build_drive_label_enrichment_entity(
                 "spreadsheetId".to_string(),
                 Value::String(file_id.to_string()),
             );
+        }
+        ("slides", "presentations") => {
+            entity.insert(
+                "presentationId".to_string(),
+                Value::String(file_id.to_string()),
+            );
+        }
+        ("forms", "forms") => {
+            entity.insert("formId".to_string(), Value::String(file_id.to_string()));
         }
         _ => {
             entity.insert("id".to_string(), Value::String(file_id.to_string()));
@@ -587,11 +619,98 @@ fn extract_sheets_touched_spreadsheets(response_json: &Value) -> Vec<Value> {
     touched
 }
 
+fn extract_slides_presentation_metadata(presentation_value: &Value) -> Option<Value> {
+    let Value::Object(obj) = presentation_value else {
+        return None;
+    };
+
+    let mut metadata = Map::new();
+    for key in ["presentationId", "title", "revisionId"] {
+        if let Some(value) = obj.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn extract_slides_touched_presentations(response_json: &Value) -> Vec<Value> {
+    let mut touched = Vec::new();
+
+    if let Some(presentations) = response_json
+        .get("presentations")
+        .and_then(|v| v.as_array())
+    {
+        for presentation in presentations {
+            if let Some(meta) = extract_slides_presentation_metadata(presentation) {
+                touched.push(meta);
+            }
+        }
+    }
+
+    if let Some(meta) = extract_slides_presentation_metadata(response_json) {
+        touched.push(meta);
+    }
+
+    touched
+}
+
+fn extract_forms_form_metadata(form_value: &Value) -> Option<Value> {
+    let Value::Object(obj) = form_value else {
+        return None;
+    };
+
+    let mut metadata = Map::new();
+    for key in ["formId", "revisionId", "responderUri", "linkedSheetId"] {
+        if let Some(value) = obj.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if let Some(title) = obj
+        .get("info")
+        .and_then(|i| i.get("title"))
+        .or_else(|| obj.get("title"))
+    {
+        metadata.insert("title".to_string(), title.clone());
+    }
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    }
+}
+
+fn extract_forms_touched_forms(response_json: &Value) -> Vec<Value> {
+    let mut touched = Vec::new();
+
+    if let Some(forms) = response_json.get("forms").and_then(|v| v.as_array()) {
+        for form in forms {
+            if let Some(meta) = extract_forms_form_metadata(form) {
+                touched.push(meta);
+            }
+        }
+    }
+
+    if let Some(meta) = extract_forms_form_metadata(response_json) {
+        touched.push(meta);
+    }
+
+    touched
+}
+
 fn extract_touched_entities(service: &str, resource: &str, response_json: &Value) -> Vec<Value> {
     match (service, resource) {
         ("drive", "files") => extract_drive_touched_files(response_json),
         ("docs", "documents") => extract_docs_touched_documents(response_json),
         ("sheets", "spreadsheets") => extract_sheets_touched_spreadsheets(response_json),
+        ("slides", "presentations") => extract_slides_touched_presentations(response_json),
+        ("forms", "forms") => extract_forms_touched_forms(response_json),
         _ => Vec::new(),
     }
 }
@@ -645,6 +764,10 @@ fn build_file_audit_context(
         ("docs", "documents", &["documentId"])
     } else if is_sheets_spreadsheets_method(doc, method) {
         ("sheets", "spreadsheets", &["spreadsheetId"])
+    } else if is_slides_presentations_method(doc, method) {
+        ("slides", "presentations", &["presentationId"])
+    } else if is_forms_forms_method(doc, method) {
+        ("forms", "forms", &["formId"])
     } else {
         return None;
     };
@@ -2016,6 +2139,36 @@ mod tests {
     }
 
     #[test]
+    fn test_should_fetch_drive_label_enrichment_for_slides_presentations() {
+        let ctx = FileAuditContext {
+            service: "slides".to_string(),
+            resource: "presentations".to_string(),
+            operation: "get".to_string(),
+            method_id: "slides.presentations.get".to_string(),
+            http_method: "GET".to_string(),
+            request_ids: vec!["pres-1".to_string()],
+            request_metadata: None,
+            upload_source: None,
+        };
+        assert!(should_fetch_drive_label_enrichment(&ctx));
+    }
+
+    #[test]
+    fn test_should_fetch_drive_label_enrichment_for_forms_forms() {
+        let ctx = FileAuditContext {
+            service: "forms".to_string(),
+            resource: "forms".to_string(),
+            operation: "get".to_string(),
+            method_id: "forms.forms.get".to_string(),
+            http_method: "GET".to_string(),
+            request_ids: vec!["form-1".to_string()],
+            request_metadata: None,
+            upload_source: None,
+        };
+        assert!(should_fetch_drive_label_enrichment(&ctx));
+    }
+
+    #[test]
     fn test_build_file_audit_context_identifies_drive_files() {
         let doc = RestDescription {
             name: "drive".to_string(),
@@ -2086,6 +2239,66 @@ mod tests {
     }
 
     #[test]
+    fn test_build_file_audit_context_identifies_slides_presentations() {
+        let doc = RestDescription {
+            name: "slides".to_string(),
+            ..Default::default()
+        };
+        let method = RestMethod {
+            id: Some("slides.presentations.get".to_string()),
+            http_method: "GET".to_string(),
+            path: "v1/presentations/{presentationId}".to_string(),
+            ..Default::default()
+        };
+        let mut params = Map::new();
+        params.insert("presentationId".to_string(), json!("pres-1"));
+        let input = ExecutionInput {
+            params,
+            body: None,
+            full_url: "https://slides.googleapis.com/v1/presentations/pres-1".to_string(),
+            query_params: Vec::new(),
+            is_upload: false,
+        };
+
+        let ctx = build_file_audit_context(&doc, &method, &input, &None)
+            .expect("slides presentations method should produce audit context");
+        assert_eq!(ctx.service, "slides");
+        assert_eq!(ctx.resource, "presentations");
+        assert_eq!(ctx.operation, "get");
+        assert_eq!(ctx.request_ids, vec!["pres-1".to_string()]);
+    }
+
+    #[test]
+    fn test_build_file_audit_context_identifies_forms_forms() {
+        let doc = RestDescription {
+            name: "forms".to_string(),
+            ..Default::default()
+        };
+        let method = RestMethod {
+            id: Some("forms.forms.get".to_string()),
+            http_method: "GET".to_string(),
+            path: "v1/forms/{formId}".to_string(),
+            ..Default::default()
+        };
+        let mut params = Map::new();
+        params.insert("formId".to_string(), json!("form-1"));
+        let input = ExecutionInput {
+            params,
+            body: None,
+            full_url: "https://forms.googleapis.com/v1/forms/form-1".to_string(),
+            query_params: Vec::new(),
+            is_upload: false,
+        };
+
+        let ctx = build_file_audit_context(&doc, &method, &input, &None)
+            .expect("forms forms method should produce audit context");
+        assert_eq!(ctx.service, "forms");
+        assert_eq!(ctx.resource, "forms");
+        assert_eq!(ctx.operation, "get");
+        assert_eq!(ctx.request_ids, vec!["form-1".to_string()]);
+    }
+
+    #[test]
     fn test_extract_touched_entities_for_sheets_response() {
         let response = json!({
             "spreadsheetId": "sheet-1",
@@ -2096,6 +2309,32 @@ mod tests {
         let touched = extract_touched_entities("sheets", "spreadsheets", &response);
         assert_eq!(touched[0]["spreadsheetId"], "sheet-1");
         assert!(touched[0].get("updates").is_some());
+    }
+
+    #[test]
+    fn test_extract_touched_entities_for_slides_response() {
+        let response = json!({
+            "presentationId": "pres-1",
+            "title": "Quarterly Review",
+            "revisionId": "rev-1"
+        });
+        let touched = extract_touched_entities("slides", "presentations", &response);
+        assert_eq!(touched[0]["presentationId"], "pres-1");
+        assert_eq!(touched[0]["title"], "Quarterly Review");
+    }
+
+    #[test]
+    fn test_extract_touched_entities_for_forms_response() {
+        let response = json!({
+            "formId": "form-1",
+            "revisionId": "rev-2",
+            "info": {
+                "title": "Security Intake"
+            }
+        });
+        let touched = extract_touched_entities("forms", "forms", &response);
+        assert_eq!(touched[0]["formId"], "form-1");
+        assert_eq!(touched[0]["title"], "Security Intake");
     }
 
     #[tokio::test]
